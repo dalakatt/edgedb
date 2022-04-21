@@ -257,6 +257,13 @@ def gen_dml_cte(
         name=ctx.env.aliases.get(hint='m')
     )
 
+    # Due to the fact that DML statements are structured
+    # as a flat list of CTEs instead of nested range vars,
+    # the top level path scope must be empty.  The necessary
+    # range vars will be injected explicitly in all rels that
+    # need them.
+    ctx.path_scope.maps.clear()
+
     if range_rvar is not None:
         relctx.pull_path_namespace(
             target=dml_stmt, source=range_rvar, ctx=ctx)
@@ -273,19 +280,25 @@ def gen_dml_cte(
             rexpr=pathctx.get_rvar_path_identity_var(
                 range_rvar, target_ir_set.path_id, env=ctx.env)
         )
+        # Do extra delete filtering
+        if (
+            isinstance(ir_stmt, irast.DeleteStmt)
+            and (pol_expr := ir_stmt.policy_exprs.get(typeref.id))
+        ):
+            with ctx.subrel() as sctx:
+                val = clauses.compile_filter_clause(
+                    pol_expr.expr, pol_expr.cardinality, ctx=sctx)
+            sctx.rel.target_list.append(pgast.ResTarget(val=val))
+
+            dml_stmt.where_clause = astutils.extend_binop(
+                dml_stmt.where_clause, sctx.rel
+            )
 
         # UPDATE has "FROM", while DELETE has "USING".
         if isinstance(dml_stmt, pgast.UpdateStmt):
             dml_stmt.from_clause.append(range_rvar)
         elif isinstance(dml_stmt, pgast.DeleteStmt):
             dml_stmt.using_clause.append(range_rvar)
-
-    # Due to the fact that DML statements are structured
-    # as a flat list of CTEs instead of nested range vars,
-    # the top level path scope must be empty.  The necessary
-    # range vars will be injected explicitly in all rels that
-    # need them.
-    ctx.path_scope.maps.clear()
 
     pathctx.put_path_value_rvar(
         dml_stmt, target_path_id, dml_stmt.relation, env=ctx.env)
@@ -716,6 +729,65 @@ def process_insert_body(
             dml_parts,
             ctx=ctx,
         )
+
+    if pol_expr := ir_stmt.policy_exprs.get(typeref.id):
+        compile_policy_check(
+            insert_cte, ir_stmt, pol_expr, typeref=typeref, ctx=ctx
+        )
+
+
+def compile_policy_check(
+        dml_cte: pgast.CommonTableExpr,
+        ir_stmt: irast.MutatingStmt,
+        policy_expr: irast.PolicyExpr,
+        typeref: irast.TypeRef,
+        *,
+        ctx: context.CompilerContextLevel) -> None:
+    subject_id = ir_stmt.subject.path_id
+
+    with ctx.newrel() as ictx:
+        # Pull in ptr rel overlays, so we can see the pointers
+        ictx.ptr_rel_overlays = ctx.ptr_rel_overlays.copy()
+        ictx.ptr_rel_overlays[None] = ictx.ptr_rel_overlays[None].copy()
+        ictx.ptr_rel_overlays[None].update(
+            ictx.ptr_rel_overlays[ir_stmt])
+
+        dml_rvar = relctx.rvar_for_rel(dml_cte, ctx=ctx)
+        relctx.include_rvar(ictx.rel, dml_rvar, path_id=subject_id, ctx=ictx)
+
+        cond_ref = clauses.compile_filter_clause(
+            policy_expr.expr, policy_expr.cardinality, ctx=ictx)
+
+        op = 'insert' if isinstance(ir_stmt, irast.InsertStmt) else 'update'
+        msg = f'access policy violation on {op} of {typeref.name_hint}'
+        maybe_raise = pgast.FuncCall(
+            name=('edgedb', 'raise_on_null'),
+            args=[
+                pgast.FuncCall(
+                    name=('nullif',),
+                    args=[cond_ref, pgast.BooleanConstant(val='false')],
+                ),
+                pgast.StringConstant(val='wrong_object_type'),  # XXX?
+                pgast.NamedFuncArg(
+                    name='msg',
+                    val=pgast.StringConstant(val=msg),
+                ),
+                pgast.NamedFuncArg(
+                    name='table',
+                    val=pgast.StringConstant(val=str(typeref.id)),
+                ),
+            ],
+        )
+        ictx.rel.target_list.append(
+            pgast.ResTarget(name='error', val=maybe_raise)
+        )
+
+        policy_cte = pgast.CommonTableExpr(
+            query=ictx.rel,
+            name=ctx.env.aliases.get('policy')
+        )
+        ctx.env.check_ctes.append(policy_cte)
+        ictx.toplevel_stmt.append_cte(policy_cte)
 
 
 def insert_needs_conflict_cte(
@@ -1171,6 +1243,11 @@ def process_update_body(
 
         if check_cte is not None:
             ctx.env.check_ctes.append(check_cte)
+
+    if pol_expr := ir_stmt.policy_exprs.get(typeref.id):
+        compile_policy_check(
+            update_cte, ir_stmt, pol_expr, typeref=typeref, ctx=ctx
+        )
 
 
 def process_update_conflicts(

@@ -485,10 +485,9 @@ def compile_InsertQuery(
                 stmt.on_conflict = conflicts.compile_insert_unless_conflict(
                     stmt, stmt_subject_stype, ctx=ictx)
 
+        mat_stype = schemactx.get_material_type(stmt_subject_stype, ctx=ctx)
         result = setgen.class_set(
-            schemactx.get_material_type(stmt_subject_stype, ctx=ctx),
-            path_id=stmt.subject.path_id,
-            ctx=ctx,
+            mat_stype, path_id=stmt.subject.path_id, ctx=ctx
         )
 
         with ictx.new() as resultctx:
@@ -499,6 +498,11 @@ def compile_InsertQuery(
                 compile_views=ictx.stmt is ictx.toplevel_stmt,
                 ctx=resultctx,
             )
+
+        if pol_condition := compile_dml_policy(
+            mat_stype, result, mode=qltypes.AccessKind.Write, ctx=ctx
+        ):
+            stmt.policy_exprs[mat_stype.id] = pol_condition
 
         result = fini_stmt(stmt, expr, ctx=ictx, parent_ctx=ctx)
 
@@ -523,6 +527,32 @@ def compile_InsertQuery(
                     parser_context=result.context)
 
     return result
+
+
+# XXX: have a policies file?
+def compile_dml_policy(
+    stype: s_objtypes.ObjectType,
+    result: irast.Set,
+    mode: qltypes.AccessKind, *,
+    ctx: context.ContextLevel,
+) -> Optional[irast.PolicyExpr]:
+    if not ctx.type_rewrites.get((stype, False)):
+        return None
+
+    condition = setgen.get_rewrite_filter(stype, mode=mode, ctx=ctx)
+    if not condition:
+        return None
+    with ctx.detached() as subctx:
+        # XXX: or like, always skip it all
+        result = setgen.class_set(
+            stype, path_id=result.path_id, skip_subtypes=True, ctx=ctx)
+
+        subctx.anchors[qlast.Subject().name] = result
+        subctx.partial_path_prefix = result
+        # subctx.path_scope = subctx.env.path_scope.root  # ??
+        return irast.PolicyExpr(
+            expr=dispatch.compile(condition, ctx=subctx)
+        )
 
 
 def _get_dunder_type_ptrref(ctx: context.ContextLevel) -> irast.PointerRef:
@@ -597,10 +627,9 @@ def compile_UpdateQuery(
 
         ctx.env.dml_stmts.add(stmt)
 
+        mat_stype = schemactx.get_material_type(stmt_subject_stype, ctx=ctx)
         result = setgen.class_set(
-            schemactx.get_material_type(stmt_subject_stype, ctx=ctx),
-            path_id=stmt.subject.path_id,
-            ctx=ctx,
+            mat_stype, path_id=stmt.subject.path_id, ctx=ctx,
         )
 
         with ictx.new() as resultctx:
@@ -611,6 +640,12 @@ def compile_UpdateQuery(
                 compile_views=ictx.stmt is ictx.toplevel_stmt,
                 ctx=resultctx,
             )
+
+        for dmat_stype in {mat_stype} | mat_stype.descendants(ctx.env.schema):
+            if pol_cond := compile_dml_policy(
+                dmat_stype, result, mode=qltypes.AccessKind.Write, ctx=ctx
+            ):
+                stmt.policy_exprs[dmat_stype.id] = pol_cond
 
         stmt.conflict_checks = conflicts.compile_inheritance_conflict_checks(
             stmt, stmt_subject_stype, ctx=ictx)
@@ -700,10 +735,11 @@ def compile_DeleteQuery(
             )
 
         stmt_subject_stype = setgen.get_set_type(subject, ctx=ictx)
+        assert isinstance(stmt_subject_stype, s_objtypes.ObjectType)
+
+        mat_stype = schemactx.get_material_type(stmt_subject_stype, ctx=ctx)
         result = setgen.class_set(
-            schemactx.get_material_type(stmt_subject_stype, ctx=ctx),
-            path_id=stmt.subject.path_id,
-            ctx=ctx,
+            mat_stype, path_id=stmt.subject.path_id, ctx=ctx
         )
 
         with ictx.new() as resultctx:
@@ -714,6 +750,12 @@ def compile_DeleteQuery(
                 compile_views=ictx.stmt is ictx.toplevel_stmt,
                 ctx=resultctx,
             )
+
+        for dmat_stype in {mat_stype} | mat_stype.descendants(ctx.env.schema):
+            if pol_cond := compile_dml_policy(
+                dmat_stype, result, mode=qltypes.AccessKind.Delete, ctx=ctx
+            ):
+                stmt.policy_exprs[dmat_stype.id] = pol_cond
 
         result = fini_stmt(stmt, expr, ctx=ictx, parent_ctx=ctx)
 

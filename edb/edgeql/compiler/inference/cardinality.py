@@ -1105,6 +1105,11 @@ def _infer_stmt_cardinality(
     _infer_matset_cardinality(
         ir.materialized_sets, scope_tree=scope_tree, ctx=ctx)
 
+    if isinstance(ir, irast.MutatingStmt):
+        for pol in ir.policy_exprs.values():
+            pol.cardinality = infer_cardinality(
+                pol.expr, scope_tree=scope_tree, ctx=ctx)
+
     return result_card
 
 

@@ -44,6 +44,7 @@ from edb.schema import links as s_links
 from edb.schema import name as s_name
 from edb.schema import objtypes as s_objtypes
 from edb.schema import pointers as s_pointers
+from edb.schema import policies as s_policies
 from edb.schema import pseudo as s_pseudo
 from edb.schema import scalars as s_scalars
 from edb.schema import sources as s_sources
@@ -83,8 +84,13 @@ def new_set(
     Absolutely all ir.Set instances must be created using this
     constructor.
     """
+
+    skip_subtypes: bool = kwargs.get('skip_subtypes', False)
+    rw_key = (stype, skip_subtypes)
+
+    # TODO: dump all this, turn it into access policies
     if (
-        stype not in ctx.type_rewrites
+        rw_key not in ctx.type_rewrites
         and isinstance(stype, s_objtypes.ObjectType)
         and ctx.env.options.apply_query_rewrites
         and (filters := stype.get_access_policy_filters(ctx.env.schema))
@@ -102,10 +108,17 @@ def new_set(
             subctx.expr_exposed = context.Exposure.UNEXPOSED
             subctx.path_scope = subctx.env.path_scope.root
             # Put a placeholder to prevent recursion.
-            subctx.type_rewrites[stype] = irast.Set()  # type: ignore
+            subctx.type_rewrites[rw_key] = None
             filtered_set = dispatch.compile(qry, ctx=subctx)
             assert isinstance(filtered_set, irast.Set)
-            subctx.type_rewrites[stype] = filtered_set
+            subctx.type_rewrites[rw_key] = filtered_set
+
+    if (
+        rw_key not in ctx.type_rewrites
+        and isinstance(stype, s_objtypes.ObjectType)
+        and ctx.env.options.apply_query_rewrites
+    ):
+        try_type_rewrite(stype=stype, skip_subtypes=skip_subtypes, ctx=ctx)
 
     typeref = typegen.type_to_typeref(stype, env=ctx.env)
     ir_set = ircls(typeref=typeref, **kwargs)
@@ -154,6 +167,7 @@ def new_set_from_set(
         is_binding: Optional[irast.BindingKind]=None,
         is_materialized_ref: Optional[bool]=None,
         is_visible_binding_ref: Optional[bool]=None,
+        skip_subtypes: Optional[bool]=None,
         ctx: context.ContextLevel) -> irast.Set:
     """Create a new ir.Set from another ir.Set.
 
@@ -183,6 +197,8 @@ def new_set_from_set(
         is_materialized_ref = ir_set.is_materialized_ref
     if is_visible_binding_ref is None:
         is_visible_binding_ref = ir_set.is_visible_binding_ref
+    if skip_subtypes is None:
+        skip_subtypes = ir_set.skip_subtypes
     return new_set(
         path_id=path_id,
         path_scope_id=path_scope_id,
@@ -193,6 +209,7 @@ def new_set_from_set(
         is_binding=is_binding,
         is_materialized_ref=is_materialized_ref,
         is_visible_binding_ref=is_visible_binding_ref,
+        skip_subtypes=skip_subtypes,
         ircls=type(ir_set),
         ctx=ctx,
     )
@@ -244,6 +261,221 @@ def new_array_set(
     typeref = typegen.type_to_typeref(stype, env=ctx.env)
     arr = irast.Array(elements=elements, typeref=typeref)
     return ensure_set(arr, type_override=stype, ctx=ctx)
+
+
+def get_access_policies(
+    stype: s_objtypes.ObjectType, *, ctx: context.ContextLevel,
+) -> Tuple[s_policies.AccessPolicy, ...]:
+    schema = ctx.env.schema
+    if not ctx.env.options.apply_user_access_policies:
+        return ()
+
+    return stype.get_access_policies(schema).objects(schema)
+
+
+def has_own_policies(
+    *,
+    stype: s_objtypes.ObjectType,
+    skip_from: Optional[s_objtypes.ObjectType]=None,
+    ctx: context.ContextLevel,
+) -> bool:
+    # XXX: some kind of caching or precomputation
+
+    schema = ctx.env.schema
+    for pol in get_access_policies(stype, ctx=ctx):
+        if not any(
+            skip_from == base.get_subject(schema)
+            for base in pol.get_bases(schema).objects(schema)
+        ):
+            return True
+
+    return any(
+        has_own_policies(stype=child, skip_from=stype, ctx=ctx)
+        for child in stype.children(schema)
+    )
+
+
+def get_rewrite_filter(
+    stype: s_objtypes.ObjectType, *,
+    mode: qltypes.AccessKind,
+    ctx: context.ContextLevel,
+) -> Optional[qlast.Expr]:
+    schema = ctx.env.schema
+    pols = get_access_policies(stype, ctx=ctx)
+
+    allow, deny = [], []
+    for pol in pols:
+        if not set(pol.get_access_kind(schema)) & {mode, 'All'}:
+            continue
+
+        is_allow = pol.get_action(schema) == qltypes.AccessPolicyAction.Allow
+        expr = pol.get_expr(schema).qlast
+        if condition := pol.get_condition(schema):
+            expr = qlast.BinOp(op='AND', left=condition.qlast, right=expr)
+
+        if is_allow:
+            allow.append(expr)
+        else:
+            deny.append(expr)
+
+    if not pols:
+        filter_expr = None
+    elif allow:
+        filter_expr = astutils.extend_binop(None, *allow, op='OR')
+    else:
+        filter_expr = qlast.BooleanConstant(value='false')
+
+    if deny:
+        deny_expr = qlast.UnaryOp(
+            op='NOT',
+            operand=astutils.extend_binop(None, *deny, op='OR')
+        )
+        filter_expr = astutils.extend_binop(filter_expr, deny_expr)
+
+    # This is a bad hack, but add an always false condition that
+    # postgres does not *know* is always false. This prevents postgres
+    # from bogusly optimizing away the entire type CTE if it can prove
+    # it empty (which could then result in assert_exists on links to
+    # the type not always firing).
+    if filter_expr and mode == qltypes.AccessKind.Read:
+        bogus_check = qlast.BinOp(
+            op='?=',
+            left=qlast.Path(partial=True, steps=[qlast.Ptr(
+                ptr=qlast.ObjectRef(name='id'))]),
+            right=qlast.TypeCast(
+                type=qlast.TypeName(maintype=qlast.ObjectRef(
+                    module='__std__', name='uuid')),
+                expr=qlast.Set(elements=[]),
+            )
+        )
+        filter_expr = astutils.extend_binop(filter_expr, bogus_check, op='OR')
+
+    return filter_expr
+
+
+def try_type_rewrite(
+    *,
+    stype: s_objtypes.ObjectType,
+    skip_subtypes: bool,
+    ctx: context.ContextLevel,
+) -> None:
+    schema = ctx.env.schema
+    rw_key = (stype, skip_subtypes)
+
+    # make sure the base types in unions and intersections have their
+    # rewrites compiled
+    if stype.is_compound_type(schema):
+        ctx.type_rewrites[rw_key] = None
+        objs = (
+            stype.get_union_of(schema).objects(schema) +
+            stype.get_intersection_of(schema).objects(schema)
+        )
+        for obj in objs:
+            srw_key = (obj, skip_subtypes)
+            if srw_key not in ctx.type_rewrites:
+                try_type_rewrite(
+                    stype=obj, skip_subtypes=skip_subtypes, ctx=ctx)
+                # Mark this as having a real rewrite if any parts do
+                if ctx.type_rewrites[srw_key]:
+                    ctx.type_rewrites[rw_key] = True
+        return
+
+    # What we *hope* to do, is to just directly select from the view
+    # for our type and apply filters to it.
+    #
+    # If some of our children have their own policies, though, we want
+    # to instead union together all of our children.
+    #
+    # But if that is the case, and some of our children have
+    # overlapping descendants, then we can't do that either, so we
+    # need to explicitly compute out all of the descendants.
+    children_have_policies = not skip_subtypes and any(
+        has_own_policies(stype=child, skip_from=stype, ctx=ctx)
+        for child in stype.children(schema)
+    )
+
+    pols = get_access_policies(stype, ctx=ctx)
+    if not pols and not children_have_policies:
+        ctx.type_rewrites[rw_key] = None
+        return
+
+    # XXX: cache
+    children_overlap = False
+    if children_have_policies:
+        all_descs = [
+            x
+            for child in stype.children(schema)
+            for x in child.descendants(schema)
+        ]
+        descs = set(all_descs)
+        if len(descs) != len(all_descs):
+            children_overlap = True
+
+    # Put a placeholder to prevent recursion.
+    ctx.type_rewrites[rw_key] = None
+
+    sets = []
+    if not (children_have_policies and stype.get_abstract(schema)):
+        with ctx.detached() as subctx:
+            base_set = class_set(
+                stype=stype,
+                skip_subtypes=children_have_policies or skip_subtypes,
+                ctx=subctx)
+
+            # XXX: doc
+            if base_set.skip_subtypes == skip_subtypes:
+                from . import clauses
+
+                filtered_stmt = irast.SelectStmt(result=base_set)
+                subctx.anchors[qlast.Subject().name] = base_set
+                subctx.partial_path_prefix = base_set
+                subctx.path_scope = subctx.env.path_scope.root
+
+                clauses.compile_where_clause(
+                    filtered_stmt,
+                    get_rewrite_filter(
+                        stype, mode=qltypes.AccessKind.Read, ctx=subctx),
+                    ctx=subctx)
+
+                filtered_set = ensure_set(filtered_stmt, ctx=subctx)
+            else:
+                filtered_set = base_set
+
+            sets.append(filtered_set)
+
+    if children_have_policies and not skip_subtypes:
+        # N.B: we don't filter here, we just generate references
+        # they will go in their own CTEs
+        children = stype.children(schema) if not children_overlap else descs
+        sets += [
+            # We need to wrap it in a type override so that unioning
+            # them all together works...
+            expression_set(
+                ensure_stmt(
+                    class_set(
+                        stype=child, skip_subtypes=children_overlap, ctx=ctx),
+                    ctx=ctx),
+                type_override=stype,
+                ctx=ctx,
+            )
+            for child in children
+            # XXX: is there a right way here
+            if child.get_name(schema).module != 'cfg'
+            if not child.is_free_object_type(schema)
+        ]
+
+    if len(sets) > 1:
+        with ctx.new() as subctx:
+            # XXX: ... it doesn't... work always, without the unexposed...
+            subctx.expr_exposed = context.Exposure.UNEXPOSED
+            subctx.anchors = subctx.anchors.copy()
+            parts: List[qlast.Expr] = [subctx.create_anchor(x) for x in sets]
+            filtered_set = dispatch.compile(
+                qlast.Set(elements=parts), ctx=subctx)
+    else:
+        filtered_set = sets[0]
+
+    ctx.type_rewrites[rw_key] = filtered_set
 
 
 def compile_path(expr: qlast.Path, *, ctx: context.ContextLevel) -> irast.Set:
@@ -793,6 +1025,25 @@ def extend_path(
     return target_set
 
 
+def needs_rewrite_existence_assertion(
+    ptrcls: s_pointers.PointerLike,
+    *,
+    ctx: context.ContextLevel,
+) -> bool:
+    """Determines if we need to inject an assert_exists for a pointer
+
+    Required pointers to types with access policies need to have an
+    assert_exists added
+    """
+
+    return bool(
+        ptrcls.get_required(ctx.env.schema)
+        and (target := ptrcls.get_target(ctx.env.schema))
+        and ctx.type_rewrites.get((target, False))
+        and ptrcls.get_shortname(ctx.env.schema).name != '__type__'
+    )
+
+
 def is_injected_computable_ptr(
     ptrcls: s_pointers.PointerLike,
     *,
@@ -801,7 +1052,10 @@ def is_injected_computable_ptr(
     return (
         ctx.env.options.apply_query_rewrites
         and ptrcls not in ctx.disable_shadowing
-        and bool(ptrcls.get_schema_reflection_default(ctx.env.schema))
+        and (
+            bool(ptrcls.get_schema_reflection_default(ctx.env.schema))
+            or needs_rewrite_existence_assertion(ptrcls, ctx=ctx)
+        )
     )
 
 
@@ -1034,11 +1288,13 @@ def type_intersection_set(
 def class_set(
         stype: s_types.Type, *,
         path_id: Optional[irast.PathId]=None,
+        skip_subtypes: bool=False,
         ctx: context.ContextLevel) -> irast.Set:
 
     if path_id is None:
         path_id = pathctx.get_path_id(stype, ctx=ctx)
-    return new_set(path_id=path_id, stype=stype, ctx=ctx)
+    return new_set(
+        path_id=path_id, stype=stype, skip_subtypes=skip_subtypes, ctx=ctx)
 
 
 def expression_set(
@@ -1216,35 +1472,47 @@ def computable_ptr_set(
         comp_expr = ptrcls.get_expr(ctx.env.schema)
         schema_qlexpr: Optional[qlast.Expr] = None
         if comp_expr is None and ctx.env.options.apply_query_rewrites:
+            assert isinstance(ptrcls, s_pointers.Pointer)
+            ptrcls_n = ptrcls.get_shortname(ctx.env.schema).name
+            path = qlast.Path(
+                steps=[
+                    qlast.Source(),
+                    qlast.Ptr(
+                        ptr=qlast.ObjectRef(name=ptrcls_n),
+                        direction=s_pointers.PointerDirection.Outbound,
+                        type=(
+                            'property'
+                            if ptrcls.is_link_property(ctx.env.schema)
+                            else None
+                        )
+                    )
+                ],
+            )
+
             schema_deflt = ptrcls.get_schema_reflection_default(ctx.env.schema)
             if schema_deflt is not None:
-                assert isinstance(ptrcls, s_pointers.Pointer)
-                ptrcls_n = ptrcls.get_shortname(ctx.env.schema).name
                 schema_qlexpr = qlast.BinOp(
-                    left=qlast.Path(
-                        steps=[
-                            qlast.Source(),
-                            qlast.Ptr(
-                                ptr=qlast.ObjectRef(name=ptrcls_n),
-                                direction=s_pointers.PointerDirection.Outbound,
-                                type=(
-                                    'property'
-                                    if ptrcls.is_link_property(ctx.env.schema)
-                                    else None
-                                )
-                            )
-                        ],
-                    ),
+                    left=path,
                     right=qlparser.parse_fragment(schema_deflt),
                     op='??',
                 )
 
-                # Is this is a view, we want to shadow the underlying
-                # ptrcls, since otherwise we will generate this default
-                # code *twice*.
-                if rptr.ptrref.base_ptr:
-                    ptrcls_to_shadow = typegen.ptrcls_from_ptrref(
-                        rptr.ptrref.base_ptr, ctx=ctx)
+            if needs_rewrite_existence_assertion(ptrcls, ctx=ctx):
+                # Wrap it in a dummy select so that we can't optimize away
+                # the assert_exists.
+                # TODO: do something less bad
+                arg = qlast.SelectQuery(
+                    result=path, where=qlast.BooleanConstant(value='true'))
+                schema_qlexpr = qlast.FunctionCall(
+                    func=('__std__', 'assert_exists'), args=[arg]
+                )
+
+            # Is this is a view, we want to shadow the underlying
+            # ptrcls, since otherwise we will generate this default
+            # code *twice*.
+            if rptr.ptrref.base_ptr:
+                ptrcls_to_shadow = typegen.ptrcls_from_ptrref(
+                    rptr.ptrref.base_ptr, ctx=ctx)
 
         if schema_qlexpr is None:
             if comp_expr is None:

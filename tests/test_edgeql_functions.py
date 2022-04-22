@@ -4813,3 +4813,107 @@ class TestEdgeQLFunctions(tb.QueryTestCase):
                 ('2021-02-16T00:00:00+00:00', '2021-03-31T00:00:00+00:00'),
             ],
         )
+
+    async def test_edgeql_functions_bitwise_01(self):
+        await self.assert_query_result(
+            r'''select bit_and(<int16>6, <int16>12);''',
+            {4},
+        )
+        await self.assert_query_result(
+            r'''select bit_and(<int32>6, <int32>12);''',
+            {4},
+        )
+        await self.assert_query_result(
+            r'''select bit_and(<int64>6, <int64>12);''',
+            {4},
+        )
+
+    async def test_edgeql_functions_bitwise_02(self):
+        await self.assert_query_result(
+            r'''select bit_or(<int16>6, <int16>12);''',
+            {14},
+        )
+        await self.assert_query_result(
+            r'''select bit_or(<int32>6, <int32>12);''',
+            {14},
+        )
+        await self.assert_query_result(
+            r'''select bit_or(<int64>6, <int64>12);''',
+            {14},
+        )
+
+    async def test_edgeql_functions_bitwise_03(self):
+        await self.assert_query_result(
+            r'''select bit_xor(<int16>6, <int16>12);''',
+            {10},
+        )
+        await self.assert_query_result(
+            r'''select bit_xor(<int32>6, <int32>12);''',
+            {10},
+        )
+        await self.assert_query_result(
+            r'''select bit_xor(<int64>6, <int64>12);''',
+            {10},
+        )
+
+    async def test_edgeql_functions_bitwise_04(self):
+        # 1111111111111111 corresponds to -1 int16
+        # Generally the result of logical NOT is expected to be:
+        #   NOT a = (-a - 1)
+        # Because the number and its bitwise negation must add up to -1.
+        await self.assert_query_result(
+            r'''select bit_not(<int16>123);''',
+            {-124},
+        )
+        await self.assert_query_result(
+            r'''select bit_not(<int32>123);''',
+            {-124},
+        )
+        await self.assert_query_result(
+            r'''select bit_not(<int64>123);''',
+            {-124},
+        )
+
+    async def test_edgeql_functions_bitwise_05(self):
+        await self.assert_query_result(
+            r'''select bit_lshift(<int16>5, 2);''',
+            {20},
+        )
+        await self.assert_query_result(
+            r'''select bit_lshift(<int32>5, 2);''',
+            {20},
+        )
+        await self.assert_query_result(
+            r'''select bit_lshift(<int64>5, 2);''',
+            {20},
+        )
+
+    async def test_edgeql_functions_bitwise_06(self):
+        await self.assert_query_result(
+            r'''select bit_rshift(<int16>13, 2);''',
+            {3},
+        )
+        await self.assert_query_result(
+            r'''select bit_rshift(<int32>13, 2);''',
+            {3},
+        )
+        await self.assert_query_result(
+            r'''select bit_rshift(<int64>13, 2);''',
+            {3},
+        )
+
+    async def test_edgeql_functions_bitwise_07(self):
+        # Right shift preserves the sign.
+        # 1111111111110011 >> 2 = 1111111111111100
+        await self.assert_query_result(
+            r'''select bit_rshift(<int16>-13, 2);''',
+            {-4},
+        )
+        await self.assert_query_result(
+            r'''select bit_rshift(<int32>-13, 2);''',
+            {-4},
+        )
+        await self.assert_query_result(
+            r'''select bit_rshift(<int64>-13, 2);''',
+            {-4},
+        )

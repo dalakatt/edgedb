@@ -5543,16 +5543,13 @@ class TestEdgeQLDDL(tb.DDLTestCase):
                 };
             """)
 
-        async with self.assertRaisesRegexTx(
-            edgedb.SchemaDefinitionError,
-            r"possibly more than one element returned",
-        ):
-            await self.con.execute("""
-                create type X {
-                    create access policy test
-                        allow all using ({true, false});
-                };
-            """)
+        # This is fine though
+        await self.con.execute("""
+            create type X {
+                create access policy test
+                    allow all using ({true, false});
+            };
+        """)
 
     async def test_edgeql_ddl_global_01(self):
         INTRO_Q = '''

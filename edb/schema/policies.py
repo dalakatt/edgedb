@@ -142,15 +142,10 @@ class AccessPolicyCommand(
             )
             assert isinstance(expression.irast, irast.Statement)
 
-            zero = expression.irast.cardinality.can_be_zero()
-            if zero or expression.irast.cardinality.is_multi():
+            if expression.irast.cardinality.can_be_zero():
                 srcctx = self.get_attribute_source_context(field)
-                if zero:
-                    problem = 'an empty set'
-                else:
-                    problem = 'more than one element'
                 raise errors.SchemaDefinitionError(
-                    f'possibly {problem} returned by {vname} '
+                    f'possibly an empty set returned by {vname} '
                     f'expression for the {pol_name} ',
                     context=srcctx
                 )

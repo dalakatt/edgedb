@@ -9,3 +9,4 @@ Tutorials
     :maxdepth: 1
 
     rest_apis_with_fastapi
+    nextjs
